@@ -1,0 +1,120 @@
+version: "3.7"
+services:
+    redis:
+        image: redis:7.0-alpine
+        restart: unless-stopped
+        env_file:
+            - .env
+        healthcheck:
+            test: [ "CMD", "redis-cli", "--raw", "incr", "ping" ]
+
+    postgres:
+        image: postgres:14-alpine
+        restart: unless-stopped
+        environment:
+            - POSTGRES_USER=airflow
+            - POSTGRES_PASSWORD=airflow
+            - POSTGRES_DB=airflow
+            - PGDATA=${DB_VOLUME_CONTAINER}
+        env_file:
+            - .env
+        volumes:
+            - "db:${DB_VOLUME_CONTAINER}"
+        healthcheck:
+            test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+            interval: 30s
+            timeout: 30s
+            retries: 3
+
+    webserver:
+        build: .
+        restart: unless-stopped
+        depends_on:
+            - postgres
+            - redis
+        environment:
+            - POSTGRES_USER=${POSTGRES_USER}
+            - POSTGRES_DB=${POSTGRES_DB}
+            - POSTGRES_PASSWORD=airflow
+        env_file:
+            - .env
+        volumes:
+            - "./dags:${AIRFLOW_DAG_DIR}"
+        ports:
+            - "8080:8080"
+        command: webserver
+        healthcheck:
+            test: ["CMD-SHELL", "[ -f ${AIRFLOW_HOME}/airflow-webserver.pid ]"]
+            interval: 30s
+            timeout: 30s
+            retries: 3
+
+    flower:
+        build: .
+        restart: unless-stopped
+        depends_on:
+            - redis
+        environment:
+            - POSTGRES_USER=${POSTGRES_USER}
+            - POSTGRES_DB=${POSTGRES_DB}
+            - POSTGRES_PASSWORD=airflow
+        env_file:
+            - .env
+        ports:
+            - "5555:5555"
+        command: celery flower
+
+    scheduler:
+        build: .
+        restart: unless-stopped
+        depends_on:
+            - webserver
+        volumes:
+            - "./dags:${AIRFLOW_DAG_DIR}"
+        environment:
+            - POSTGRES_USER=${POSTGRES_USER}
+            - POSTGRES_DB=${POSTGRES_DB}
+        env_file:
+            - .env
+        command: scheduler
+
+    worker:
+        build: .
+        restart: unless-stopped
+        depends_on:
+            - scheduler
+        volumes:
+            - "./dags:${AIRFLOW_DAG_DIR}"
+            # need to mount dns mapping file because kerberos is a bitch
+            - "./dns/hosts:/etc/hosts"
+            - krb5:${KERBEROS_KEYTAB_DIR}:rw
+            - ./krb/krb5.conf:/etc/krb5.conf:rw
+            - ./krb/krb5.conf:${JAVA_HOME}/jre/lib/security/krb5.conf:rw
+            # mount ur own connection
+            - ./hadoop:${HADOOP_HOME}/etc/hadoop
+            - ./spark:${SPARK_HOME}/conf
+        environment:
+            - POSTGRES_USER=${POSTGRES_USER}
+            - POSTGRES_DB=${POSTGRES_DB}
+        env_file:
+            - .env
+        command: celery worker
+
+    refresher:
+        image: npsables/kerberos-refresher:1.0.0
+        depends_on:
+            - worker
+        env_file:
+            - .env
+        volumes:
+            - krb5:${KERBEROS_KEYTAB_DIR}:rw
+            - ./krb/krb5.conf:/etc/krb5.conf:rw
+
+volumes:
+  db:
+  krb5:
+    driver: local
+    driver_opts:
+      o: bind
+      type: none
+      device: ./krb
